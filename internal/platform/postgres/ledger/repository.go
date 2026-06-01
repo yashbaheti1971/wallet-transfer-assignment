@@ -96,20 +96,35 @@ func (r *BalanceRepository) GetBalance(ctx context.Context, walletID string) (*l
 // DebitAndCredit debit from the source wallet and credit the destination wallet
 // inside a single transaction, using row‑level locks for concurrency safety.
 func (r *BalanceRepository) DebitAndCredit(ctx context.Context, fromWalletID, toWalletID string, amount int64) error {
-	var fromBal, toBal BalanceModel
+	var fromBal BalanceModel
 	db := getTx(ctx, r.db)
-	
-	// Lock source row.
-	if err := db.WithContext(ctx).
-		Clauses(clause.Locking{Strength: "UPDATE"}).
-		First(&fromBal, "wallet_id = ?", fromWalletID).Error; err != nil {
-		return fmt.Errorf("debit balance not found: %w", err)
+
+	// 1. Determine consistent locking order to prevent deadlocks
+	firstLockID, secondLockID := fromWalletID, toWalletID
+	if fromWalletID > toWalletID {
+		firstLockID, secondLockID = toWalletID, fromWalletID
 	}
-	// Lock destination row.
+
+	// 2. Acquire the first lock
+	var firstBal, secondBal BalanceModel
 	if err := db.WithContext(ctx).
 		Clauses(clause.Locking{Strength: "UPDATE"}).
-		First(&toBal, "wallet_id = ?", toWalletID).Error; err != nil {
-		return fmt.Errorf("credit balance not found: %w", err)
+		First(&firstBal, "wallet_id = ?", firstLockID).Error; err != nil {
+		return fmt.Errorf("balance not found for wallet %s: %w", firstLockID, err)
+	}
+
+	// 3. Acquire the second lock
+	if err := db.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		First(&secondBal, "wallet_id = ?", secondLockID).Error; err != nil {
+		return fmt.Errorf("balance not found for wallet %s: %w", secondLockID, err)
+	}
+
+	// 4. Map the locks back to from/to balances for the business logic
+	if fromWalletID == firstLockID {
+		fromBal = firstBal
+	} else {
+		fromBal = secondBal
 	}
 	// Ensure sufficient funds.
 	if fromBal.Amount < amount {

@@ -72,6 +72,17 @@ func NewConnection(dsn string) (*DB, error) {
 		return nil, fmt.Errorf("failed to seed default wallet balance: %w", err)
 	}
 
+	// Configure the underlying connection pool to prevent "too many clients" errors
+	sqlDB, err := gdb.DB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get underlying sql.DB: %w", err)
+	}
+	
+	// PostgreSQL defaults to max 100 connections. Limit GORM to 50 concurrent open connections.
+	sqlDB.SetMaxOpenConns(50)
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetConnMaxLifetime(time.Hour)
+
 	return &DB{gormDB: gdb}, nil
 }
 
