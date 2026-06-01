@@ -87,7 +87,7 @@ func (m *mockTxStarter) BeginTx(ctx context.Context) (context.Context, tx.Tx, er
 // --- Tests ---
 
 func TestService_Execute(t *testing.T) {
-	t.Run("Idempotency - existing transfer", func(t *testing.T) {
+	t.Run("Idempotency - PROCESSED returns immediately", func(t *testing.T) {
 		existing := &transfer.Transfer{ID: "txn_123", Status: transfer.StatusProcessed}
 		repo := &mockTransferRepo{
 			getByTxnIDFunc: func(ctx context.Context, txnID string) (*transfer.Transfer, error) {
@@ -96,12 +96,78 @@ func TestService_Execute(t *testing.T) {
 		}
 		svc := transfer.NewService(repo, nil, nil)
 		res, err := svc.Execute(context.Background(), &transfer.CreateRequest{TxnID: "idem_1"})
-		
+
 		if err != nil {
 			t.Errorf("expected nil error, got %v", err)
 		}
 		if res != existing {
 			t.Errorf("expected existing transfer, got %v", res)
+		}
+	})
+
+	t.Run("Idempotency - FAILED returns immediately", func(t *testing.T) {
+		existing := &transfer.Transfer{ID: "txn_fail", Status: transfer.StatusFailed, FailureReason: "wallet inactive"}
+		repo := &mockTransferRepo{
+			getByTxnIDFunc: func(ctx context.Context, txnID string) (*transfer.Transfer, error) {
+				return existing, nil
+			},
+		}
+		svc := transfer.NewService(repo, nil, nil)
+		res, err := svc.Execute(context.Background(), &transfer.CreateRequest{TxnID: "idem_fail"})
+
+		if err != nil {
+			t.Errorf("expected nil error for terminal FAILED, got %v", err)
+		}
+		if res != existing {
+			t.Errorf("expected existing FAILED transfer, got %v", res)
+		}
+	})
+
+	t.Run("Idempotency - PENDING resumes workflow", func(t *testing.T) {
+		// A prior attempt created a PENDING record but was interrupted.
+		// Execute should resume and complete it to PROCESSED.
+		pending := &transfer.Transfer{
+			ID:           "txn_pending",
+			TxnID:        "idem_resume",
+			FromWalletID: "w1",
+			ToWalletID:   "w2",
+			Amount:       100,
+			Status:       transfer.StatusPending,
+		}
+		statusUpdated := false
+		repo := &mockTransferRepo{
+			getByTxnIDFunc: func(ctx context.Context, txnID string) (*transfer.Transfer, error) {
+				return pending, nil
+			},
+			// Create must NOT be called — we're resuming an existing record.
+			createFunc: func(ctx context.Context, tr *transfer.Transfer) error {
+				t.Error("Create should not be called when resuming a PENDING transfer")
+				return nil
+			},
+			updateStatusFunc: func(ctx context.Context, id string, status transfer.Status, reason string) error {
+				statusUpdated = true
+				if status != transfer.StatusProcessed {
+					t.Errorf("expected status PROCESSED on resume, got %v", status)
+				}
+				return nil
+			},
+		}
+		wRepo := &mockWalletRepo{
+			validateWalletsFunc: func(ctx context.Context, ids []string) error { return nil },
+		}
+		ledgerSvc := ledger.NewService(&mockLedgerRepo{}, &mockBalanceRepo{}, &mockTxStarter{})
+
+		svc := transfer.NewService(repo, wRepo, ledgerSvc)
+		tr, err := svc.Execute(context.Background(), &transfer.CreateRequest{TxnID: "idem_resume"})
+
+		if err != nil {
+			t.Errorf("expected successful resume, got error %v", err)
+		}
+		if !statusUpdated {
+			t.Error("expected status to be updated to PROCESSED in DB after resume")
+		}
+		if tr.Status != transfer.StatusProcessed {
+			t.Errorf("expected transfer status PROCESSED after resume, got %v", tr.Status)
 		}
 	})
 
@@ -176,20 +242,23 @@ func TestService_Execute(t *testing.T) {
 		}
 	})
 
-	t.Run("Ledger Failure", func(t *testing.T) {
+	t.Run("Ledger Failure - InsufficientBalance leaves PENDING (retryable)", func(t *testing.T) {
+		// ErrInsufficientBalance is retryable — balance state can change between attempts.
+		// The transfer must remain PENDING; UpdateStatus must NOT be called.
 		repo := &mockTransferRepo{
-			getByTxnIDFunc: func(ctx context.Context, txnID string) (*transfer.Transfer, error) { return nil, nil },
-			createFunc:     func(ctx context.Context, tr *transfer.Transfer) error { return nil },
-			updateStatusFunc: func(ctx context.Context, id string, status transfer.Status, reason string) error { return nil },
+			getByTxnIDFunc:   func(ctx context.Context, txnID string) (*transfer.Transfer, error) { return nil, nil },
+			createFunc:       func(ctx context.Context, tr *transfer.Transfer) error { return nil },
+			updateStatusFunc: func(ctx context.Context, id string, status transfer.Status, reason string) error {
+				t.Errorf("UpdateStatus must not be called for retryable error, got status %v", status)
+				return nil
+			},
 		}
 		wRepo := &mockWalletRepo{
 			validateWalletsFunc: func(ctx context.Context, ids []string) error { return nil },
 		}
-		
-		// Setup ledger service with a failing balance repo
 		bRepo := &mockBalanceRepo{
 			debitAndCreditFunc: func(ctx context.Context, from, to string, amt int64) error {
-				return errors.New("insufficient balance")
+				return ledger.ErrInsufficientBalance
 			},
 		}
 		ledgerSvc := ledger.NewService(&mockLedgerRepo{}, bRepo, &mockTxStarter{})
@@ -197,14 +266,60 @@ func TestService_Execute(t *testing.T) {
 		svc := transfer.NewService(repo, wRepo, ledgerSvc)
 		req := &transfer.CreateRequest{TxnID: "idem_5", FromWalletID: "w1", ToWalletID: "w2", Amount: 100}
 		tr, err := svc.Execute(context.Background(), req)
-		
+
 		if err == nil {
-			t.Error("expected error for ledger failure")
+			t.Error("expected error for insufficient balance")
 		}
-		if tr.Status != transfer.StatusFailed {
-			t.Errorf("expected transfer status FAILED, got %v", tr.Status)
+		if !errors.Is(err, ledger.ErrInsufficientBalance) {
+			t.Errorf("expected wrapped ErrInsufficientBalance in error chain, got: %v", err)
+		}
+		// Transfer must remain PENDING — balance can change; the caller should retry.
+		if tr.Status != transfer.StatusPending {
+			t.Errorf("expected transfer to remain PENDING for retryable error, got %v", tr.Status)
 		}
 	})
+
+	t.Run("Ledger Failure - Technical error leaves PENDING (retryable)", func(t *testing.T) {
+		// A non-business error from the ledger (e.g. DB connectivity, tx abort)
+		// must leave the transfer PENDING so the caller can retry.
+		// UpdateStatus must NOT be called — the record stays in PENDING.
+		repo := &mockTransferRepo{
+			getByTxnIDFunc: func(ctx context.Context, txnID string) (*transfer.Transfer, error) { return nil, nil },
+			createFunc:     func(ctx context.Context, tr *transfer.Transfer) error { return nil },
+			updateStatusFunc: func(ctx context.Context, id string, status transfer.Status, reason string) error {
+				t.Errorf("UpdateStatus must not be called for retryable error, got status %v", status)
+				return nil
+			},
+		}
+		wRepo := &mockWalletRepo{
+			validateWalletsFunc: func(ctx context.Context, ids []string) error { return nil },
+		}
+		// Simulate a technical DB failure (not a business rule violation)
+		techErr := errors.New("connection reset by peer")
+		bRepo := &mockBalanceRepo{
+			debitAndCreditFunc: func(ctx context.Context, from, to string, amt int64) error {
+				return techErr
+			},
+		}
+		ledgerSvc := ledger.NewService(&mockLedgerRepo{}, bRepo, &mockTxStarter{})
+
+		svc := transfer.NewService(repo, wRepo, ledgerSvc)
+		req := &transfer.CreateRequest{TxnID: "idem_retry", FromWalletID: "w1", ToWalletID: "w2", Amount: 100}
+		tr, err := svc.Execute(context.Background(), req)
+
+		if err == nil {
+			t.Error("expected error for technical ledger failure")
+		}
+		// Error message must signal retryability
+		if !errors.Is(err, techErr) {
+			t.Errorf("expected wrapped techErr in error chain, got: %v", err)
+		}
+		// Transfer must remain PENDING — not FAILED
+		if tr.Status != transfer.StatusPending {
+			t.Errorf("expected transfer to remain PENDING for retryable error, got %v", tr.Status)
+		}
+	})
+
 
 	t.Run("Success", func(t *testing.T) {
 		statusUpdated := false

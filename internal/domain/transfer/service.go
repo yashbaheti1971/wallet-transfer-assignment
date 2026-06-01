@@ -45,72 +45,94 @@ func NewService(repo Repository, walletRepo wallet.Repository, ledgerSvc *ledger
 // Execute runs the full transfer workflow.
 //
 // Workflow:
-//  1. Idempotency check   — return existing transfer if txnId already seen.
-//  2. Persist PENDING     — record created before any validation or money movement.
-//  3. Validate transfer   — amount, wallet IDs; failure marks transfer FAILED.
-//  4. Validate wallets    — single SQL query (existence + ACTIVE); failure marks FAILED.
-//  5. CommitToLedger      — ledger service owns the transaction internally; failure marks FAILED.
-//  6. Mark PROCESSED      — terminal success state.
-//
-// Every error after step 2 results in a FAILED transfer record so the attempt
-// is always auditable regardless of where in the flow it failed.
+//  1. Idempotency check   — if txnId seen in PENDING state, resume workflow from DB data.
+//     If already in a terminal state (PROCESSED/FAILED), return immediately.
+//     If no record exists, persist a new PENDING record.
+//  2. Validate transfer   — amount, wallet IDs; business failure marks transfer FAILED.
+//  3. Validate wallets    — single SQL query (existence + ACTIVE); business failure marks FAILED.
+//  4. CommitToLedger      — ledger service owns the transaction internally.
+//     All ledger errors (including insufficient balance) leave the record PENDING
+//     and are retryable — balance state can change between attempts.
+//  5. Mark PROCESSED      — terminal success state.
 func (s *Service) Execute(ctx context.Context, req *CreateRequest) (*Transfer, error) {
-	// ── Step 1: Idempotency ──────────────────────────────────────────────────
-	if existing, _ := s.repo.GetByTxnID(ctx, req.TxnID); existing != nil {
-		return existing, nil
+	// ── Step 1: Idempotency / Resume ─────────────────────────────────────────
+	var t *Transfer
+
+	existing, err := s.repo.GetByTxnID(ctx, req.TxnID)
+	if err != nil {
+		// Technical failure looking up the record — surface and let caller retry.
+		return nil, fmt.Errorf("transfer: idempotency lookup: %w", err)
 	}
 
-	// ── Step 2: Persist PENDING ──────────────────────────────────────────────
-	// The record is written to the DB before any validation or money movement.
-	// This guarantees every attempted transfer is auditable, even on failure.
-	now := timeutil.Now()
-	t := &Transfer{
-		ID:           NewID(), // "txn_<uuidv7>"
-		TxnID:        req.TxnID,
-		FromWalletID: req.FromWalletID,
-		ToWalletID:   req.ToWalletID,
-		Amount:       req.Amount,
-		Status:       StatusPending,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-	if err := s.repo.Create(ctx, t); err != nil {
-		// Record does not exist yet — cannot mark FAILED; just surface the error.
-		return nil, fmt.Errorf("transfer: create pending record: %w", err)
+	if existing != nil {
+		switch existing.Status {
+		case StatusProcessed, StatusFailed:
+			// Terminal state — return as-is; no further work needed.
+			return existing, nil
+		case StatusPending:
+			// A prior attempt was interrupted mid-flight.
+			// Resume the workflow using the data already committed to the DB.
+			t = existing
+		}
+	} else {
+		// No existing record — create a new PENDING entry.
+		now := timeutil.Now()
+		t = &Transfer{
+			ID:           NewID(), // "txn_<uuidv7>"
+			TxnID:        req.TxnID,
+			FromWalletID: req.FromWalletID,
+			ToWalletID:   req.ToWalletID,
+			Amount:       req.Amount,
+			Status:       StatusPending,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+		if err := s.repo.Create(ctx, t); err != nil {
+			// Record does not exist yet — cannot mark FAILED; surface the error.
+			return nil, fmt.Errorf("transfer: create pending record: %w", err)
+		}
 	}
 
-	// markFailed is a local helper used by every subsequent error path.
-	// It updates both the in-memory entity and the DB record atomically.
+	// markFailed transitions the transfer to FAILED — used for business validation
+	// errors that are deterministic and should not be retried (e.g. bad amount,
+	// inactive wallet).
 	markFailed := func(reason string) (*Transfer, error) {
 		_ = t.MarkFailed(reason)
 		_ = s.repo.UpdateStatus(ctx, t.ID, StatusFailed, reason)
 		return t, errors.New(reason)
 	}
 
-	// ── Step 3: Validate transfer entity ─────────────────────────────────────
+	// markRetryable leaves the transfer in PENDING and surfaces the error
+	// so the caller knows to retry. The DB record is intentionally not touched
+	// so the next call can resume from this point.
+	markRetryable := func(err error) (*Transfer, error) {
+		return t, fmt.Errorf("transfer: technical failure (retryable): %w", err)
+	}
+
+	// ── Step 2: Validate transfer entity ─────────────────────────────────────
 	// Catches: invalid amount (<= 0), same source/destination wallet, missing fields.
+	// These are business rule violations — mark FAILED permanently.
 	if err := t.Validate(); err != nil {
 		return markFailed(err.Error())
 	}
 
-	// ── Step 4: Validate wallets ─────────────────────────────────────────────
+	// ── Step 3: Validate wallets ─────────────────────────────────────────────
 	// Single SQL query: WHERE id = ANY($1) AND status = 'ACTIVE'
-	// Catches: wallet not found, wallet inactive.
-	if err := s.walletRepo.ValidateWallets(ctx, []string{req.FromWalletID, req.ToWalletID}); err != nil {
-		fmt.Println("Error in Wallet Validation")
+	// Catches: wallet not found, wallet inactive — business failures → FAILED.
+	if err := s.walletRepo.ValidateWallets(ctx, []string{t.FromWalletID, t.ToWalletID}); err != nil {
 		return markFailed(fmt.Sprintf("wallet validation failed: %v", err))
 	}
 
-	// ── Step 5: CommitToLedger ───────────────────────────────────────────────
+	// ── Step 4: CommitToLedger ───────────────────────────────────────────────
 	// LedgerService owns BeginTx / Commit / Rollback internally.
 	// No transaction object crosses domain boundaries.
-	// Catches: insufficient balance, DB errors during balance update or entry insert.
-	if err := s.ledgerSvc.CommitToLedger(ctx, t.ID, req.FromWalletID, req.ToWalletID, req.Amount); err != nil {
-		fmt.Println("Error in Ledger is", err.Error())
-		return markFailed(err.Error())
+	// All ledger errors (including ErrInsufficientBalance) are retryable —
+	// balance state can change between retry attempts.
+	if err := s.ledgerSvc.CommitToLedger(ctx, t.ID, t.FromWalletID, t.ToWalletID, t.Amount); err != nil {
+		return markRetryable(err)
 	}
 
-	// ── Step 6: Mark PROCESSED ───────────────────────────────────────────────
+	// ── Step 5: Mark PROCESSED ───────────────────────────────────────────────
 	_ = t.MarkProcessed()
 	_ = s.repo.UpdateStatus(ctx, t.ID, StatusProcessed, "")
 	return t, nil
