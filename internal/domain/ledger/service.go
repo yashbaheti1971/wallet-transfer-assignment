@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
+	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/timeutil"
 	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/tx"
 )
 
@@ -51,13 +51,13 @@ func (s *Service) GetBalance(ctx context.Context, walletID string) (*Balance, er
 //
 // Returns ErrInsufficientBalance if the source balance would go negative.
 func (s *Service) CommitToLedger(ctx context.Context, transferID, fromWalletID, toWalletID string, amount int64) error {
-	tx, err := s.db.BeginTx(ctx)
+	txCtx, tx, err := s.db.BeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("ledger.CommitToLedger: begin tx: %w", err)
 	}
 
 	// balanceRepo: row lock + balance check + debit/credit update.
-	if err := s.balanceRepo.DebitAndCredit(ctx, fromWalletID, toWalletID, amount); err != nil {
+	if err := s.balanceRepo.DebitAndCredit(txCtx, fromWalletID, toWalletID, amount); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("ledger.CommitToLedger: balance: %w", err)
 	}
@@ -65,7 +65,7 @@ func (s *Service) CommitToLedger(ctx context.Context, transferID, fromWalletID, 
 	// ledgerRepo: double-entry insert.
 	// Composite key (transfer_id, type) is UNIQUE in the DB — a duplicate
 	// CommitToLedger call for the same transferID is caught before any row is written.
-	now := time.Now().UTC()
+	now := timeutil.Now()
 	debit := &Entry{
 		TransferID: transferID,
 		WalletID:   fromWalletID,
@@ -80,7 +80,8 @@ func (s *Service) CommitToLedger(ctx context.Context, transferID, fromWalletID, 
 		Amount:     amount,
 		CreatedAt:  now,
 	}
-	if err := s.ledgerRepo.InsertDoubleEntry(ctx, debit, credit); err != nil {
+
+	if err := s.ledgerRepo.InsertDoubleEntry(txCtx, debit, credit); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("ledger.CommitToLedger: entries: %w", err)
 	}

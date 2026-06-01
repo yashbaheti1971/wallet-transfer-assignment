@@ -4,7 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
+
+	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/timeutil"
 )
 
 // ErrNotFound is returned when a wallet lookup yields no result.
@@ -35,7 +36,7 @@ func (s *Service) GetByID(ctx context.Context, id string) (*Wallet, error) {
 // Create constructs, validates, and persists a new wallet.
 // The ID is domain-generated (prefixed UUID v7) before any DB interaction.
 func (s *Service) Create(ctx context.Context, ownerID, currency string) (*Wallet, error) {
-	now := time.Now().UTC()
+	now := timeutil.Now()
 	w := &Wallet{
 		ID:        NewID(), // "wallet_<uuidv7>" — domain-owned, time-ordered
 		OwnerID:   ownerID,

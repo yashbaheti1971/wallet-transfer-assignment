@@ -3,6 +3,8 @@ package transfer
 import (
 	"errors"
 	"time"
+
+	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/timeutil"
 )
 
 // Status represents the state machine for a transfer.
@@ -73,7 +75,7 @@ func (t *Transfer) MarkProcessed() error {
 		return errors.New("transfer: invalid state transition to PROCESSED")
 	}
 	t.Status = StatusProcessed
-	t.UpdatedAt = time.Now().UTC()
+	t.UpdatedAt = timeutil.Now()
 	return nil
 }
 
@@ -84,6 +86,6 @@ func (t *Transfer) MarkFailed(reason string) error {
 	}
 	t.Status = StatusFailed
 	t.FailureReason = reason
-	t.UpdatedAt = time.Now().UTC()
+	t.UpdatedAt = timeutil.Now()
 	return nil
 }

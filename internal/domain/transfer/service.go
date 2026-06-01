@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/domain/ledger"
 	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/domain/wallet"
+	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/timeutil"
 )
 
 // ErrDuplicateTxn is returned when a txnId already maps to an existing transfer.
@@ -63,7 +63,7 @@ func (s *Service) Execute(ctx context.Context, req *CreateRequest) (*Transfer, e
 	// ── Step 2: Persist PENDING ──────────────────────────────────────────────
 	// The record is written to the DB before any validation or money movement.
 	// This guarantees every attempted transfer is auditable, even on failure.
-	now := time.Now().UTC()
+	now := timeutil.Now()
 	t := &Transfer{
 		ID:           NewID(), // "txn_<uuidv7>"
 		TxnID:        req.TxnID,

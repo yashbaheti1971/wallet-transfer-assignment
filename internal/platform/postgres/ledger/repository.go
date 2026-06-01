@@ -5,9 +5,18 @@ import (
 	"fmt"
 
 	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/domain/ledger"
+	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/tx"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// getTx extracts the injected transaction from the context if it exists.
+func getTx(ctx context.Context, defaultDB *gorm.DB) *gorm.DB {
+	if txDB, ok := tx.ExtractTx(ctx).(*gorm.DB); ok {
+		return txDB
+	}
+	return defaultDB
+}
 
 // LedgerRepository implements the ledger.LedgerRepository interface using GORM.
 type LedgerRepository struct {
@@ -20,7 +29,7 @@ func NewLedger(db *gorm.DB) *LedgerRepository {
 }
 
 // InsertDoubleEntry inserts a debit and a credit entry atomically.
-// The caller passes a *gorm.DB* that already represents an ongoing transaction.
+// The caller passes a context that may contain an ongoing transaction.
 func (r *LedgerRepository) InsertDoubleEntry(ctx context.Context, debit, credit *ledger.Entry) error {
 	// Convert domain entries to GORM models.
 	debitM := EntryModel{
@@ -38,7 +47,8 @@ func (r *LedgerRepository) InsertDoubleEntry(ctx context.Context, debit, credit 
 		CreatedAt:  credit.CreatedAt,
 	}
 	// Batch insert both rows.
-	return r.db.WithContext(ctx).Create([]EntryModel{debitM, creditM}).Error
+	db := getTx(ctx, r.db)
+	return db.WithContext(ctx).Create([]EntryModel{debitM, creditM}).Error
 }
 
 // GetByWalletID returns all ledger entries for a wallet, newest first.
@@ -87,14 +97,16 @@ func (r *BalanceRepository) GetBalance(ctx context.Context, walletID string) (*l
 // inside a single transaction, using row‑level locks for concurrency safety.
 func (r *BalanceRepository) DebitAndCredit(ctx context.Context, fromWalletID, toWalletID string, amount int64) error {
 	var fromBal, toBal BalanceModel
+	db := getTx(ctx, r.db)
+	
 	// Lock source row.
-	if err := r.db.WithContext(ctx).
+	if err := db.WithContext(ctx).
 		Clauses(clause.Locking{Strength: "UPDATE"}).
 		First(&fromBal, "wallet_id = ?", fromWalletID).Error; err != nil {
 		return fmt.Errorf("debit balance not found: %w", err)
 	}
 	// Lock destination row.
-	if err := r.db.WithContext(ctx).
+	if err := db.WithContext(ctx).
 		Clauses(clause.Locking{Strength: "UPDATE"}).
 		First(&toBal, "wallet_id = ?", toWalletID).Error; err != nil {
 		return fmt.Errorf("credit balance not found: %w", err)
@@ -105,7 +117,7 @@ func (r *BalanceRepository) DebitAndCredit(ctx context.Context, fromWalletID, to
 	}
 	// Apply relative updates atomically.
 	// Debit source wallet.
-	if err := r.db.WithContext(ctx).
+	if err := db.WithContext(ctx).
 		Model(&BalanceModel{}).
 		Where("wallet_id = ?", fromWalletID).
 		Updates(map[string]any{
@@ -114,7 +126,7 @@ func (r *BalanceRepository) DebitAndCredit(ctx context.Context, fromWalletID, to
 		return err
 	}
 	// Credit destination wallet.
-	if err := r.db.WithContext(ctx).
+	if err := db.WithContext(ctx).
 		Model(&BalanceModel{}).
 		Where("wallet_id = ?", toWalletID).
 		Updates(map[string]any{

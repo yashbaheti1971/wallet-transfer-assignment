@@ -15,6 +15,7 @@ import (
 	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/postgres/ledger"
 	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/postgres/transfer"
 	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/postgres/wallet"
+	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/timeutil"
 	"github.com/yashbaheti1971/wallet-transfer-assignment/internal/platform/tx"
 	"gorm.io/gorm/clause"
 )
@@ -55,8 +56,8 @@ func NewConnection(dsn string) (*DB, error) {
 		OwnerID:   "0",
 		Currency:  "USD",
 		Status:    "ACTIVE",
-		CreatedAt: time.Now().UTC(),
-		UpdatedAt: time.Now().UTC(),
+		CreatedAt: timeutil.Now(),
+		UpdatedAt: timeutil.Now(),
 	}
 	if err := gdb.Clauses(clause.OnConflict{DoNothing: true}).Create(&defaultWallet).Error; err != nil {
 		return nil, fmt.Errorf("failed to seed default wallet: %w", err)
@@ -65,7 +66,7 @@ func NewConnection(dsn string) (*DB, error) {
 	defaultBalance := ledger.BalanceModel{
 		WalletID:  "default_wallet",
 		Amount:    9999999999999999,
-		UpdatedAt: time.Now().UTC(),
+		UpdatedAt: timeutil.Now(),
 	}
 	if err := gdb.Clauses(clause.OnConflict{DoNothing: true}).Create(&defaultBalance).Error; err != nil {
 		return nil, fmt.Errorf("failed to seed default wallet balance: %w", err)
@@ -77,13 +78,14 @@ func NewConnection(dsn string) (*DB, error) {
 // DB returns the underlying *gorm.DB for direct use when needed.
 func (d *DB) DB() *gorm.DB { return d.gormDB }
 
-// BeginTx implements the tx.Starter interface, returning a transaction wrapper.
-func (d *DB) BeginTx(ctx context.Context) (tx.Tx, error) {
-	txGorm := d.gormDB.Begin()
+// BeginTx implements the tx.Starter interface, returning a context containing the transaction and a transaction wrapper.
+func (d *DB) BeginTx(ctx context.Context) (context.Context, tx.Tx, error) {
+	txGorm := d.gormDB.WithContext(ctx).Begin()
 	if txGorm.Error != nil {
-		return nil, txGorm.Error
+		return ctx, nil, txGorm.Error
 	}
-	return &gormTx{tx: txGorm}, nil
+	txCtx := tx.InjectTx(ctx, txGorm)
+	return txCtx, &gormTx{tx: txGorm}, nil
 }
 
 // gormTx adapts a *gorm.DB transaction to the tx.Tx interface.
